@@ -765,3 +765,195 @@ async fn execute_mcp_method(
         "isError": false
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery::{RestDescription, RestMethod, RestResource, MethodParameter};
+    use std::collections::HashMap;
+
+    fn mock_config_compact(services: Vec<&str>) -> ServerConfig {
+        ServerConfig {
+            services: services.into_iter().map(String::from).collect(),
+            workflows: false,
+            _helpers: false,
+            tool_mode: ToolMode::Compact,
+        }
+    }
+
+    fn mock_doc() -> RestDescription {
+        let mut params = HashMap::new();
+        params.insert(
+            "fileId".to_string(),
+            MethodParameter {
+                param_type: Some("string".to_string()),
+                required: true,
+                location: Some("path".to_string()),
+                description: Some("The ID of the file".to_string()),
+                ..Default::default()
+            },
+        );
+        params.insert(
+            "fields".to_string(),
+            MethodParameter {
+                param_type: Some("string".to_string()),
+                required: false,
+                location: Some("query".to_string()),
+                description: Some("Selector specifying fields".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let mut methods = HashMap::new();
+        methods.insert(
+            "list".to_string(),
+            RestMethod {
+                http_method: "GET".to_string(),
+                path: "files".to_string(),
+                description: Some("Lists files".to_string()),
+                ..Default::default()
+            },
+        );
+        methods.insert(
+            "get".to_string(),
+            RestMethod {
+                http_method: "GET".to_string(),
+                path: "files/{fileId}".to_string(),
+                description: Some("Gets a file".to_string()),
+                parameters: params,
+                ..Default::default()
+            },
+        );
+
+        let mut resources = HashMap::new();
+        resources.insert(
+            "files".to_string(),
+            RestResource {
+                methods,
+                ..Default::default()
+            },
+        );
+
+        RestDescription {
+            name: "drive".to_string(),
+            resources,
+            ..Default::default()
+        }
+    }
+
+    // -- find_resource tests --
+
+    #[test]
+    fn test_find_resource_top_level() {
+        let doc = mock_doc();
+        let res = find_resource(&doc.resources, "files");
+        assert!(res.is_some());
+        assert!(res.unwrap().methods.contains_key("list"));
+    }
+
+    #[test]
+    fn test_find_resource_not_found() {
+        let doc = mock_doc();
+        assert!(find_resource(&doc.resources, "missing").is_none());
+    }
+
+    #[test]
+    fn test_find_resource_nested_dot_path() {
+        let mut inner_methods = HashMap::new();
+        inner_methods.insert(
+            "create".to_string(),
+            RestMethod {
+                http_method: "POST".to_string(),
+                path: "permissions".to_string(),
+                ..Default::default()
+            },
+        );
+        let inner = RestResource {
+            methods: inner_methods,
+            ..Default::default()
+        };
+        let mut sub_resources = HashMap::new();
+        sub_resources.insert("permissions".to_string(), inner);
+
+        let outer = RestResource {
+            resources: sub_resources,
+            ..Default::default()
+        };
+        let mut top = HashMap::new();
+        top.insert("files".to_string(), outer);
+
+        let res = find_resource(&top, "files.permissions");
+        assert!(res.is_some());
+        assert!(res.unwrap().methods.contains_key("create"));
+    }
+
+    // -- handle_discover tests --
+
+    #[test]
+    fn test_discover_service_not_enabled() {
+        let config = mock_config_compact(vec!["gmail"]);
+        let args = json!({"service": "drive"});
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(handle_discover(&args, &config));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("not enabled"));
+    }
+
+    #[test]
+    fn test_discover_missing_service_arg() {
+        let config = mock_config_compact(vec!["drive"]);
+        let args = json!({});
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(handle_discover(&args, &config));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Missing 'service'"));
+    }
+
+    // -- ToolMode tests --
+
+    #[test]
+    fn test_tool_mode_enum_equality() {
+        assert_eq!(ToolMode::Compact, ToolMode::Compact);
+        assert_ne!(ToolMode::Compact, ToolMode::Full);
+    }
+
+    // -- CLI parsing tests --
+
+    #[test]
+    fn test_cli_tool_mode_default_is_full() {
+        let cli = build_mcp_cli();
+        let matches = cli.get_matches_from(vec!["mcp"]);
+        let mode = matches.get_one::<String>("tool-mode").unwrap();
+        assert_eq!(mode, "full");
+    }
+
+    #[test]
+    fn test_cli_tool_mode_compact() {
+        let cli = build_mcp_cli();
+        let matches = cli.get_matches_from(vec!["mcp", "--tool-mode", "compact"]);
+        let mode = matches.get_one::<String>("tool-mode").unwrap();
+        assert_eq!(mode, "compact");
+    }
+
+    #[test]
+    fn test_cli_tool_mode_invalid_rejected() {
+        let cli = build_mcp_cli();
+        let result = cli.try_get_matches_from(vec!["mcp", "--tool-mode", "invalid"]);
+        assert!(result.is_err());
+    }
+
+    // -- append_workflow_tools tests --
+
+    #[test]
+    fn test_append_workflow_tools_adds_five() {
+        let mut tools = Vec::new();
+        append_workflow_tools(&mut tools);
+        assert_eq!(tools.len(), 5);
+        assert_eq!(tools[0]["name"], "workflow_standup_report");
+        assert_eq!(tools[4]["name"], "workflow_file_announce");
+    }
+}
