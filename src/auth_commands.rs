@@ -365,6 +365,11 @@ async fn handle_login(args: &[String]) -> Result<(), GwsError> {
             credential_store::encrypted_credentials_path_for(email)
         } else {
             // Legacy single-account save (no email available)
+            eprintln!(
+                "[gws] Warning: Could not determine account email. \
+                 Credentials saved in legacy format. \
+                 Re-run with 'gws auth login --account <email>' for multi-account support."
+            );
             credential_store::save_encrypted(&creds_str)
                 .map_err(|e| GwsError::Auth(format!("Failed to encrypt credentials: {e}")))?
         };
@@ -406,7 +411,10 @@ async fn handle_login(args: &[String]) -> Result<(), GwsError> {
 async fn fetch_userinfo_email(access_token: &str) -> Option<String> {
     let client = match crate::client::build_client() {
         Ok(c) => c,
-        Err(_) => return None,
+        Err(e) => {
+            eprintln!("[gws] Warning: Failed to build HTTP client for userinfo: {e}");
+            return None;
+        }
     };
     let resp = client
         .get("https://www.googleapis.com/oauth2/v2/userinfo")
@@ -415,6 +423,11 @@ async fn fetch_userinfo_email(access_token: &str) -> Option<String> {
         .await
         .ok()?;
     if !resp.status().is_success() {
+        eprintln!(
+            "[gws] Warning: userinfo request failed with HTTP {}. \
+             Account email could not be determined.",
+            resp.status()
+        );
         return None;
     }
     let body: serde_json::Value = resp.json().await.ok()?;

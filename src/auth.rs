@@ -94,7 +94,8 @@ pub async fn get_token(scopes: &[&str], account: Option<&str>) -> anyhow::Result
 /// Resolve which account to use:
 /// 1. Explicit `account` parameter takes priority.
 /// 2. Fall back to `accounts.json` default.
-/// 3. If no registry exists but legacy `credentials.enc` exists, fail with upgrade message.
+/// 3. If no registry exists but legacy `credentials.enc` exists, return None with a note
+///    (caller will use the legacy file directly).
 /// 4. If nothing exists, return None (will fall through to standard error).
 fn resolve_account(account: Option<&str>) -> anyhow::Result<Option<String>> {
     let registry = crate::accounts::load_accounts()?;
@@ -135,14 +136,13 @@ fn resolve_account(account: Option<&str>) -> anyhow::Result<Option<String>> {
         (None, None) => {
             let legacy_path = credential_store::encrypted_credentials_path();
             if legacy_path.exists() {
-                anyhow::bail!(
-                    "Legacy credentials found at {}. \
-                     gws now supports multiple accounts. \
-                     Please run 'gws auth login' to upgrade your credentials.",
+                eprintln!(
+                    "[gws] Note: Using legacy credentials from {}. \
+                     Run 'gws auth login' to upgrade to multi-account format.",
                     legacy_path.display()
                 );
             }
-            // No registry, no legacy — fall through to standard credential loading
+            // No registry — fall through to standard credential loading
             Ok(None)
         }
     }
@@ -423,6 +423,29 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "my-test-token");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_resolve_account_legacy_credentials_returns_none() {
+        // Setup: create credentials.enc but no accounts.json in a temp config dir
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR", dir.path().as_os_str());
+        }
+
+        // Create legacy credentials.enc
+        let creds_enc = dir.path().join("credentials.enc");
+        std::fs::write(&creds_enc, b"dummy-encrypted-data").unwrap();
+
+        // No accounts.json exists — resolve_account(None) should return Ok(None), not Err
+        let result = resolve_account(None);
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
+        assert!(result.unwrap().is_none());
+
+        unsafe {
+            std::env::remove_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR");
+        }
     }
 
     #[tokio::test]
