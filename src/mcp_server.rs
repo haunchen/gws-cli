@@ -241,7 +241,7 @@ async fn build_tools_list(config: &ServerConfig) -> Result<Vec<Value>, GwsError>
     // 1. Walk core services
     for svc_name in &config.services {
         let (api_name, version) =
-            crate::parse_service_and_version(std::slice::from_ref(svc_name), svc_name)?;
+            crate::parse_service_and_version(&[svc_name.to_string()], svc_name)?;
         if let Ok(doc) = crate::discovery::fetch_discovery_document(&api_name, &version).await {
             walk_resources(&doc.name, &doc.resources, &mut tools);
         } else {
@@ -262,7 +262,7 @@ async fn build_compact_tools_list(config: &ServerConfig) -> Result<Vec<Value>, G
 
     for svc_name in &config.services {
         let (api_name, version) =
-            crate::parse_service_and_version(std::slice::from_ref(svc_name), svc_name)?;
+            crate::parse_service_and_version(&[svc_name.to_string()], svc_name)?;
 
         // Build description with resource names
         let description = if let Ok(doc) =
@@ -621,19 +621,13 @@ fn find_resource<'a>(
     resources: &'a HashMap<String, RestResource>,
     path: &str,
 ) -> Option<&'a RestResource> {
-    let segments: Vec<&str> = path.split('.').collect();
-    let mut current = resources;
-    let mut found = None;
-    for seg in &segments {
-        match current.get(*seg) {
-            Some(res) => {
-                found = Some(res);
-                current = &res.resources;
-            }
-            None => return None,
-        }
+    let mut segments = path.split('.');
+    let first_segment = segments.next()?;
+    let mut current_res = resources.get(first_segment)?;
+    for segment in segments {
+        current_res = current_res.resources.get(segment)?;
     }
-    found
+    Some(current_res)
 }
 
 async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Value, GwsError> {
@@ -1054,25 +1048,23 @@ mod tests {
 
     // -- handle_discover tests --
 
-    #[test]
-    fn test_discover_service_not_enabled() {
+    #[tokio::test]
+    async fn test_discover_service_not_enabled() {
         let config = mock_config_compact(vec!["gmail"]);
         let args = json!({"service": "drive"});
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(handle_discover(&args, &config));
+        let result = handle_discover(&args, &config).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("not enabled"));
     }
 
-    #[test]
-    fn test_discover_missing_service_arg() {
+    #[tokio::test]
+    async fn test_discover_missing_service_arg() {
         let config = mock_config_compact(vec!["drive"]);
         let args = json!({});
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(handle_discover(&args, &config));
+        let result = handle_discover(&args, &config).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Missing 'service'"));
