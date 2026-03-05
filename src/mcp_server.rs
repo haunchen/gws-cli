@@ -23,11 +23,18 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ToolMode {
+    Full,
+    Compact,
+}
+
 #[derive(Debug, Clone)]
 struct ServerConfig {
     services: Vec<String>,
     workflows: bool,
     _helpers: bool,
+    tool_mode: ToolMode,
 }
 
 fn build_mcp_cli() -> Command {
@@ -54,15 +61,27 @@ fn build_mcp_cli() -> Command {
                 .action(clap::ArgAction::SetTrue)
                 .help("Expose service-specific helpers as tools"),
         )
+        .arg(
+            Arg::new("tool-mode")
+                .long("tool-mode")
+                .value_parser(["compact", "full"])
+                .default_value("full")
+                .help("Tool granularity: 'compact' (1 tool/service + discover) or 'full' (1 tool/method)"),
+        )
 }
 
 pub async fn start(args: &[String]) -> Result<(), GwsError> {
     // Parse args
     let matches = build_mcp_cli().get_matches_from(args);
+    let tool_mode = match matches.get_one::<String>("tool-mode").map(|s| s.as_str()) {
+        Some("compact") => ToolMode::Compact,
+        _ => ToolMode::Full,
+    };
     let mut config = ServerConfig {
         services: Vec::new(),
         workflows: matches.get_flag("workflows"),
         _helpers: matches.get_flag("helpers"),
+        tool_mode,
     };
 
     let svc_str = matches.get_one::<String>("services").unwrap();
@@ -86,6 +105,7 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
             "[gws mcp] Starting with services: {}",
             config.services.join(", ")
         );
+        eprintln!("[gws mcp] Tool mode: {:?}", config.tool_mode);
     }
 
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
