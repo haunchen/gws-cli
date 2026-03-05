@@ -592,6 +592,45 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
         return handle_discover(arguments, config).await;
     }
 
+    // Compact mode: tool_name IS the service alias, resource/method are in arguments
+    if config.tool_mode == ToolMode::Compact {
+        let resource_path = arguments
+            .get("resource")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| GwsError::Validation("Missing 'resource' argument".to_string()))?;
+        let method_name = arguments
+            .get("method")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| GwsError::Validation("Missing 'method' argument".to_string()))?;
+
+        let svc_alias = tool_name;
+        if !config.services.contains(&svc_alias.to_string()) {
+            return Err(GwsError::Validation(format!(
+                "Service '{}' is not enabled in this MCP session",
+                svc_alias
+            )));
+        }
+
+        let (api_name, version) =
+            crate::parse_service_and_version(&[svc_alias.to_string()], svc_alias)?;
+        let doc = crate::discovery::fetch_discovery_document(&api_name, &version).await?;
+
+        let resource = find_resource(&doc.resources, resource_path)
+            .ok_or_else(|| GwsError::Validation(format!(
+                "Resource '{}' not found in {}",
+                resource_path, svc_alias
+            )))?;
+
+        let method = resource.methods.get(method_name)
+            .ok_or_else(|| GwsError::Validation(format!(
+                "Method '{}' not found in {}.{}",
+                method_name, svc_alias, resource_path
+            )))?;
+
+        return execute_mcp_method(&doc, method, arguments).await;
+    }
+
+    // Full mode: tool_name encodes service_resource_method (e.g., drive_files_list)
     let parts: Vec<&str> = tool_name.split('_').collect();
     if parts.len() < 3 {
         return Err(GwsError::Validation(format!(
@@ -638,6 +677,14 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
         return Err(GwsError::Validation("Resource not found".to_string()));
     };
 
+    execute_mcp_method(&doc, method, arguments).await
+}
+
+async fn execute_mcp_method(
+    doc: &crate::discovery::RestDescription,
+    method: &crate::discovery::RestMethod,
+    arguments: &Value,
+) -> Result<Value, GwsError> {
     let params_json_val = arguments.get("params");
     let params_str = params_json_val
         .map(serde_json::to_string)
@@ -650,11 +697,8 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
         .transpose()
         .map_err(|e| GwsError::Validation(format!("Failed to serialize body: {e}")))?;
 
-    // Security: validate upload path to prevent arbitrary local file reads.
-    // Only allow paths within the current working directory.
     let upload_path = if let Some(raw) = arguments.get("upload").and_then(|v| v.as_str()) {
         let p = std::path::Path::new(raw);
-        // Reject absolute paths and any path that escapes cwd via "../"
         if p.is_absolute() || p.components().any(|c| c == std::path::Component::ParentDir) {
             return Err(GwsError::Validation(format!(
                 "Upload path '{}' is not allowed. Paths must be relative and within the current directory.",
@@ -665,6 +709,7 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
     } else {
         None
     };
+
     let page_all = arguments
         .get("page_all")
         .and_then(|v| v.as_bool())
@@ -672,7 +717,7 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
 
     let pagination = crate::executor::PaginationConfig {
         page_all,
-        page_limit: 100, // Safe default for MCP
+        page_limit: 100,
         page_delay_ms: 100,
     };
 
@@ -688,7 +733,7 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
     };
 
     let result = crate::executor::execute_method(
-        &doc,
+        doc,
         method,
         params_str.as_deref(),
         body_str.as_deref(),
@@ -701,7 +746,7 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
         None,
         &crate::helpers::modelarmor::SanitizeMode::Warn,
         &crate::formatter::OutputFormat::default(),
-        true, // capture_output = true!
+        true,
     )
     .await?;
 
