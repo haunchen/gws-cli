@@ -428,6 +428,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_resolve_account_legacy_credentials_returns_none() {
+        // Save the old value
+        let old_config_dir = std::env::var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR").ok();
+
         // Setup: create credentials.enc but no accounts.json in a temp config dir
         let dir = tempfile::tempdir().unwrap();
         unsafe {
@@ -444,7 +447,11 @@ mod tests {
         assert!(result.unwrap().is_none());
 
         unsafe {
-            std::env::remove_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR");
+            if let Some(v) = old_config_dir {
+                std::env::set_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR", v);
+            } else {
+                std::env::remove_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR");
+            }
         }
     }
 
