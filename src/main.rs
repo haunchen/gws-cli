@@ -71,7 +71,7 @@ async fn run() -> Result<(), GwsError> {
         ));
     }
 
-    // Find the first non-flag arg (skip --account and its value)
+    // Find the first non-flag arg (skip --account/--api-version and their values)
     let mut first_arg: Option<String> = None;
     {
         let mut skip_next = false;
@@ -80,11 +80,11 @@ async fn run() -> Result<(), GwsError> {
                 skip_next = false;
                 continue;
             }
-            if a == "--account" {
+            if a == "--account" || a == "--api-version" {
                 skip_next = true;
                 continue;
             }
-            if a.starts_with("--account=") {
+            if a.starts_with("--account=") || a.starts_with("--api-version=") {
                 continue;
             }
             if !a.starts_with("--") || a.as_str() == "--help" || a.as_str() == "--version" {
