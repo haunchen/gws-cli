@@ -1555,16 +1555,32 @@ fn is_workspace_admin_scope(url: &str) -> bool {
 /// `cloud-platform` is a cross-service scope and does not count as a match
 /// for any specific service.
 fn find_unmatched_services(scopes: &[String], services: &HashSet<String>) -> HashSet<String> {
-    services
-        .iter()
-        .filter(|svc| {
-            let single: HashSet<String> = [svc.to_string()].into_iter().collect();
-            !scopes.iter().any(|s| {
-                !s.ends_with("/cloud-platform") && scope_matches_service(s, &single)
-            })
-        })
-        .cloned()
-        .collect()
+    let mut matched_services = HashSet::new();
+
+    for scope in scopes.iter().filter(|s| !s.ends_with("/cloud-platform")) {
+        let short = match scope.strip_prefix("https://www.googleapis.com/auth/") {
+            Some(s) => s,
+            None => continue,
+        };
+        let prefix = short.split('.').next().unwrap_or(short);
+
+        for service in services {
+            if matched_services.contains(service) {
+                continue;
+            }
+            let mapped_svc = match service.as_str() {
+                "sheets" => "spreadsheets",
+                "slides" => "presentations",
+                "docs" => "documents",
+                s => s,
+            };
+            if prefix == mapped_svc || short.starts_with(&format!("{mapped_svc}.")) {
+                matched_services.insert(service.clone());
+            }
+        }
+    }
+
+    services.difference(&matched_services).cloned().collect()
 }
 
 /// Extract OAuth scope URLs from a Discovery document.
@@ -1593,18 +1609,25 @@ async fn fetch_scopes_for_unmatched_services(
     services: &HashSet<String>,
     readonly_only: bool,
 ) -> Vec<String> {
-    let mut result = Vec::new();
-    for svc in services {
-        let (api_name, version) = match crate::services::resolve_service(svc) {
-            Ok(pair) => pair,
-            Err(_) => continue,
-        };
-        let doc = match crate::discovery::fetch_discovery_document(&api_name, &version).await {
-            Ok(doc) => doc,
-            Err(_) => continue,
-        };
-        result.extend(extract_scopes_from_doc(&doc, readonly_only));
-    }
+    let futures: Vec<_> = services
+        .iter()
+        .filter_map(|svc| {
+            let (api_name, version) = crate::services::resolve_service(svc).ok()?;
+            Some(async move {
+                crate::discovery::fetch_discovery_document(&api_name, &version)
+                    .await
+                    .ok()
+                    .map(|doc| extract_scopes_from_doc(&doc, readonly_only))
+            })
+        })
+        .collect();
+
+    let mut result: Vec<String> = futures_util::future::join_all(futures)
+        .await
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect();
     result.sort();
     result.dedup();
     result
