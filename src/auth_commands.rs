@@ -129,7 +129,10 @@ fn token_cache_path() -> PathBuf {
 }
 
 /// Handle `gws auth <subcommand>`.
-pub async fn handle_auth_command(args: &[String]) -> Result<(), GwsError> {
+pub async fn handle_auth_command(
+    args: &[String],
+    global_account: Option<&str>,
+) -> Result<(), GwsError> {
     const USAGE: &str = concat!(
         "Usage: gws auth <login|setup|status|export|logout|list|default> [options]\n\n",
         "  login    Authenticate via OAuth2 (opens browser)\n",
@@ -144,6 +147,8 @@ pub async fn handle_auth_command(args: &[String]) -> Result<(), GwsError> {
         "           --project        Use a specific GCP project\n",
         "  status   Show current authentication state\n",
         "  export   Print decrypted credentials to stdout\n",
+        "           --account EMAIL  Export a specific account's credentials\n",
+        "           --unmasked       Show secrets without masking\n",
         "  logout   Clear saved credentials and token cache\n",
         "           --account EMAIL  Logout a specific account (otherwise: all)\n",
         "  list     List all registered accounts\n",
@@ -161,10 +166,7 @@ pub async fn handle_auth_command(args: &[String]) -> Result<(), GwsError> {
         "login" => handle_login(&args[1..]).await,
         "setup" => crate::setup::run_setup(&args[1..]).await,
         "status" => handle_status().await,
-        "export" => {
-            let unmasked = args.len() > 1 && args[1] == "--unmasked";
-            handle_export(unmasked).await
-        }
+        "export" => handle_export(&args[1..], global_account).await,
         "logout" => handle_logout(&args[1..]),
         "list" => handle_list(),
         "default" => handle_default(&args[1..]),
@@ -463,15 +465,40 @@ async fn fetch_userinfo_email(access_token: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-async fn handle_export(unmasked: bool) -> Result<(), GwsError> {
-    let enc_path = credential_store::encrypted_credentials_path();
+async fn handle_export(args: &[String], global_account: Option<&str>) -> Result<(), GwsError> {
+    // Parse --unmasked and --account from args
+    let mut unmasked = false;
+    let mut local_account: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--unmasked" {
+            unmasked = true;
+        } else if args[i] == "--account" && i + 1 < args.len() {
+            local_account = Some(args[i + 1].clone());
+            i += 1;
+        } else if let Some(value) = args[i].strip_prefix("--account=") {
+            local_account = Some(value.to_string());
+        }
+        i += 1;
+    }
+
+    // Resolve account: local --account > global --account > default account
+    let account = local_account.as_deref().or(global_account);
+    let resolved =
+        crate::auth::resolve_account(account).map_err(|e| GwsError::Auth(e.to_string()))?;
+
+    let enc_path = match &resolved {
+        Some(email) => credential_store::encrypted_credentials_path_for(email),
+        None => credential_store::encrypted_credentials_path(),
+    };
+
     if !enc_path.exists() {
         return Err(GwsError::Auth(
             "No encrypted credentials found. Run 'gws auth login' first.".to_string(),
         ));
     }
 
-    match credential_store::load_encrypted() {
+    match credential_store::load_encrypted_from_path(&enc_path) {
         Ok(contents) => {
             if unmasked {
                 println!("{contents}");
@@ -1740,7 +1767,7 @@ mod tests {
     #[tokio::test]
     async fn handle_auth_command_empty_args_prints_usage() {
         let args: Vec<String> = vec![];
-        let result = handle_auth_command(&args).await;
+        let result = handle_auth_command(&args, None).await;
         // Empty args now prints usage and returns Ok
         assert!(result.is_ok());
     }
@@ -1748,21 +1775,21 @@ mod tests {
     #[tokio::test]
     async fn handle_auth_command_help_flag_returns_ok() {
         let args = vec!["--help".to_string()];
-        let result = handle_auth_command(&args).await;
+        let result = handle_auth_command(&args, None).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn handle_auth_command_help_short_flag_returns_ok() {
         let args = vec!["-h".to_string()];
-        let result = handle_auth_command(&args).await;
+        let result = handle_auth_command(&args, None).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn handle_auth_command_invalid_subcommand() {
         let args = vec!["frobnicate".to_string()];
-        let result = handle_auth_command(&args).await;
+        let result = handle_auth_command(&args, None).await;
         assert!(result.is_err());
         match result.unwrap_err() {
             GwsError::Validation(msg) => assert!(msg.contains("frobnicate")),
@@ -1815,7 +1842,7 @@ mod tests {
     async fn handle_status_succeeds_without_credentials() {
         // status should always succeed and report "none"
         let args = vec!["status".to_string()];
-        let result = handle_auth_command(&args).await;
+        let result = handle_auth_command(&args, None).await;
         assert!(result.is_ok());
     }
 
@@ -2183,5 +2210,44 @@ mod tests {
     fn mask_secret_boundary() {
         // Exactly 9 chars — first 4 + last 4 with "..." in between
         assert_eq!(mask_secret("123456789"), "1234...6789");
+    }
+
+    #[tokio::test]
+    async fn handle_export_nonexistent_account_returns_auth_error() {
+        // Requesting a non-existent account should always fail
+        let args = vec![
+            "--account".to_string(),
+            "nonexistent@example.com".to_string(),
+        ];
+        let result = handle_export(&args, None).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            GwsError::Auth(_) => {} // expected
+            other => panic!("Expected Auth error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_export_global_account_nonexistent_returns_auth_error() {
+        // Global --account with non-existent email should fail
+        let args: Vec<String> = vec![];
+        let result = handle_export(&args, Some("nonexistent@example.com")).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            GwsError::Auth(_) => {} // expected
+            other => panic!("Expected Auth error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_export_dispatch_nonexistent_account() {
+        // Verify the dispatch path passes global_account through
+        let args = vec!["export".to_string()];
+        let result = handle_auth_command(&args, Some("nonexistent@example.com")).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            GwsError::Auth(_) => {} // expected
+            other => panic!("Expected Auth error, got: {other:?}"),
+        }
     }
 }
