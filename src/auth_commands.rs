@@ -469,19 +469,20 @@ async fn handle_export(args: &[String], global_account: Option<&str>) -> Result<
     // Parse --unmasked and --account from args
     let mut unmasked = false;
     let mut local_account: Option<String> = None;
-    let mut args_iter = args.iter();
+    let mut args_iter = args.iter().peekable();
     while let Some(arg) = args_iter.next() {
         match arg.as_str() {
             "--unmasked" => unmasked = true,
-            "--account" => {
-                if let Some(val) = args_iter.next() {
-                    local_account = Some(val.clone());
-                } else {
+            "--account" => match args_iter.peek() {
+                Some(val) if !val.starts_with('-') => {
+                    local_account = Some(args_iter.next().unwrap().clone());
+                }
+                _ => {
                     return Err(GwsError::Validation(
                         "The --account flag requires a value.".to_string(),
                     ));
                 }
-            }
+            },
             _ => {
                 if let Some(value) = arg.strip_prefix("--account=") {
                     local_account = Some(value.to_string());
@@ -2277,6 +2278,18 @@ mod tests {
     #[tokio::test]
     async fn handle_export_account_missing_value_returns_validation_error() {
         let args = vec!["--account".to_string()];
+        let result = handle_export(&args, None).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            GwsError::Validation(msg) => assert!(msg.contains("requires a value")),
+            other => panic!("Expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_export_account_flag_as_value_returns_validation_error() {
+        // --account followed by another flag should not treat the flag as a value
+        let args = vec!["--account".to_string(), "--unmasked".to_string()];
         let result = handle_export(&args, None).await;
         assert!(result.is_err());
         match result.unwrap_err() {
