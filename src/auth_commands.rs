@@ -469,17 +469,29 @@ async fn handle_export(args: &[String], global_account: Option<&str>) -> Result<
     // Parse --unmasked and --account from args
     let mut unmasked = false;
     let mut local_account: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--unmasked" {
-            unmasked = true;
-        } else if args[i] == "--account" && i + 1 < args.len() {
-            local_account = Some(args[i + 1].clone());
-            i += 1;
-        } else if let Some(value) = args[i].strip_prefix("--account=") {
-            local_account = Some(value.to_string());
+    let mut args_iter = args.iter();
+    while let Some(arg) = args_iter.next() {
+        match arg.as_str() {
+            "--unmasked" => unmasked = true,
+            "--account" => {
+                if let Some(val) = args_iter.next() {
+                    local_account = Some(val.clone());
+                } else {
+                    return Err(GwsError::Validation(
+                        "The --account flag requires a value.".to_string(),
+                    ));
+                }
+            }
+            _ => {
+                if let Some(value) = arg.strip_prefix("--account=") {
+                    local_account = Some(value.to_string());
+                } else {
+                    return Err(GwsError::Validation(format!(
+                        "Unknown argument for export: '{arg}'"
+                    )));
+                }
+            }
         }
-        i += 1;
     }
 
     // Resolve account: local --account > global --account > default account
@@ -2248,6 +2260,28 @@ mod tests {
         match result.unwrap_err() {
             GwsError::Auth(_) => {} // expected
             other => panic!("Expected Auth error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_export_unknown_arg_returns_validation_error() {
+        let args = vec!["--unmask".to_string()];
+        let result = handle_export(&args, None).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            GwsError::Validation(msg) => assert!(msg.contains("--unmask")),
+            other => panic!("Expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_export_account_missing_value_returns_validation_error() {
+        let args = vec!["--account".to_string()];
+        let result = handle_export(&args, None).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            GwsError::Validation(msg) => assert!(msg.contains("requires a value")),
+            other => panic!("Expected Validation error, got: {other:?}"),
         }
     }
 }
