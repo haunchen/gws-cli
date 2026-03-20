@@ -798,6 +798,65 @@ async fn enable_apis(
     (enabled, skipped, failed)
 }
 
+/// Disable deselected Workspace APIs for a project.
+/// Returns (disabled, failed) where failed includes the gcloud error message.
+async fn disable_apis(
+    project_id: &str,
+    api_ids: &[String],
+) -> (Vec<String>, Vec<(String, String)>) {
+    if api_ids.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    use futures_util::stream::StreamExt;
+
+    let results = futures_util::stream::iter(api_ids.to_vec())
+        .map(|api_id| {
+            let project_id = project_id.to_string();
+            async move {
+                let result = tokio::process::Command::new(gcloud_bin())
+                    .env("CLOUDSDK_CORE_DISABLE_PROMPTS", "1")
+                    .args(["services", "disable", &api_id, "--project", &project_id])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .await;
+                (api_id, result)
+            }
+        })
+        .buffer_unordered(5)
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut disabled = Vec::new();
+    let mut failed = Vec::new();
+
+    for (api_id, result) in results {
+        match result {
+            Ok(output) if output.status.success() => {
+                disabled.push(api_id);
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let msg = if stderr.is_empty() {
+                    format!(
+                        "gcloud services disable failed (exit code {:?})",
+                        output.status.code()
+                    )
+                } else {
+                    stderr
+                };
+                failed.push((api_id, msg));
+            }
+            Err(e) => {
+                failed.push((api_id, format!("Failed to run gcloud: {e}")));
+            }
+        }
+    }
+
+    (disabled, failed)
+}
+
 /// Get the list of already-enabled API service names for a project.
 pub fn get_enabled_apis(project_id: &str) -> Vec<String> {
     let output = gcloud_cmd()
@@ -924,6 +983,7 @@ struct SetupContext {
     client_id: String,
     client_secret: String,
     enabled: Vec<String>,
+    disabled: Vec<String>,
     skipped: Vec<String>,
     failed: Vec<(String, String)>,
 }
@@ -1297,7 +1357,7 @@ async fn stage_enable_apis(ctx: &mut SetupContext) -> Result<SetupStage, GwsErro
                         api.id.to_string()
                     },
                     selected: already,
-                    is_fixed: already,
+                    is_fixed: false,
                     is_template: false,
                     template_selects: vec![],
                 }
@@ -1310,12 +1370,13 @@ async fn stage_enable_apis(ctx: &mut SetupContext) -> Result<SetupStage, GwsErro
             .unwrap()
             .show_picker(
                 "Select APIs to enable",
-                "Space to toggle, 'a' to select all, Enter to confirm",
+                "Space to toggle, 'a' to select all, Enter to confirm (deselecting disables the API)",
                 items,
                 true,
             )
             .map_err(|e| GwsError::Validation(format!("TUI error: {e}")))?;
 
+        let apis_to_disable: Vec<String>;
         match result {
             PickerResult::Confirmed(items) => {
                 ctx.api_ids = items
@@ -1324,6 +1385,12 @@ async fn stage_enable_apis(ctx: &mut SetupContext) -> Result<SetupStage, GwsErro
                     .filter(|(_, item)| item.selected)
                     .map(|(i, _)| WORKSPACE_APIS[i].id.to_string())
                     .collect::<Vec<_>>();
+                // APIs that were enabled but the user deselected
+                apis_to_disable = already_enabled
+                    .iter()
+                    .filter(|id| !ctx.api_ids.contains(id))
+                    .cloned()
+                    .collect();
             }
             PickerResult::GoBack => {
                 return Ok(SetupStage::Project);
@@ -1333,40 +1400,91 @@ async fn stage_enable_apis(ctx: &mut SetupContext) -> Result<SetupStage, GwsErro
                 return Err(GwsError::Validation("Setup cancelled".to_string()));
             }
         }
+
+        if ctx.dry_run {
+            eprintln!("Step 4/5: Would enable {} APIs:", ctx.api_ids.len());
+            for id in &ctx.api_ids {
+                eprintln!("  + {}", id);
+            }
+            if !apis_to_disable.is_empty() {
+                eprintln!("         Would disable {} APIs:", apis_to_disable.len());
+                for id in &apis_to_disable {
+                    eprintln!("  - {}", id);
+                }
+            }
+            eprintln!("Step 5/5: Would configure OAuth credentials (Consent + Client)");
+            eprintln!();
+            let output = json!({
+                "status": "dry_run",
+                "message": "No changes were made. Run `gws auth login` to authenticate.",
+                "account": ctx.account,
+                "project": ctx.project_id,
+                "apis_would_enable": ctx.api_ids,
+                "apis_would_disable": apis_to_disable,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).unwrap_or_default()
+            );
+            return Ok(SetupStage::Finish);
+        }
+
+        // Disable deselected APIs
+        if !apis_to_disable.is_empty() {
+            ctx.wiz(
+                3,
+                StepStatus::InProgress(format!("Disabling {} APIs...", apis_to_disable.len())),
+            );
+            let (disabled_apis, disable_failed) =
+                disable_apis(&ctx.project_id, &apis_to_disable).await;
+            ctx.disabled = disabled_apis;
+            ctx.failed.extend(disable_failed);
+        }
+
+        // Enable selected APIs
+        ctx.wiz(
+            3,
+            StepStatus::InProgress(format!("Enabling {} APIs...", ctx.api_ids.len())),
+        );
+        let (enabled_apis, skipped_apis, failed_apis) =
+            enable_apis(&ctx.project_id, &ctx.api_ids).await;
+        ctx.enabled = enabled_apis;
+        ctx.skipped = skipped_apis;
+        ctx.failed.extend(failed_apis);
     } else {
         ctx.api_ids = all_api_ids().iter().map(|s| s.to_string()).collect();
-    }
 
-    if ctx.dry_run {
-        eprintln!("Step 4/5: Would enable {} APIs:", ctx.api_ids.len());
-        for id in &ctx.api_ids {
-            eprintln!("  - {}", id);
+        if ctx.dry_run {
+            eprintln!("Step 4/5: Would enable {} APIs:", ctx.api_ids.len());
+            for id in &ctx.api_ids {
+                eprintln!("  + {}", id);
+            }
+            eprintln!("Step 5/5: Would configure OAuth credentials (Consent + Client)");
+            eprintln!();
+            let output = json!({
+                "status": "dry_run",
+                "message": "No changes were made. Run `gws auth login` to authenticate.",
+                "account": ctx.account,
+                "project": ctx.project_id,
+                "apis_would_enable": ctx.api_ids,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).unwrap_or_default()
+            );
+            return Ok(SetupStage::Finish);
         }
-        eprintln!("Step 5/5: Would configure OAuth credentials (Consent + Client)");
-        eprintln!();
-        let output = json!({
-            "status": "dry_run",
-            "message": "No changes were made. Run `gws auth login` to authenticate.",
-            "account": ctx.account,
-            "project": ctx.project_id,
-            "apis_would_enable": ctx.api_ids,
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&output).unwrap_or_default()
-        );
-        return Ok(SetupStage::Finish);
-    }
 
-    ctx.wiz(
-        3,
-        StepStatus::InProgress(format!("Enabling {} APIs...", ctx.api_ids.len())),
-    );
-    let (enabled_apis, skipped_apis, failed_apis) =
-        enable_apis(&ctx.project_id, &ctx.api_ids).await;
-    ctx.enabled = enabled_apis;
-    ctx.skipped = skipped_apis;
-    ctx.failed = failed_apis;
+        ctx.wiz(
+            3,
+            StepStatus::InProgress(format!("Enabling {} APIs...", ctx.api_ids.len())),
+        );
+        let (enabled_apis, skipped_apis, failed_apis) =
+            enable_apis(&ctx.project_id, &ctx.api_ids).await;
+        ctx.enabled = enabled_apis;
+        ctx.skipped = skipped_apis;
+        ctx.failed = failed_apis;
+    }
 
     // Show failure details so the user knows what went wrong
     if !ctx.failed.is_empty() {
@@ -1377,19 +1495,23 @@ async fn stage_enable_apis(ctx: &mut SetupContext) -> Result<SetupStage, GwsErro
         eprintln!();
     }
 
-    let status_msg = if ctx.failed.is_empty() {
-        format!(
-            "{} enabled, {} skipped",
-            ctx.enabled.len(),
-            ctx.skipped.len()
-        )
+    let mut parts = Vec::new();
+    if !ctx.enabled.is_empty() {
+        parts.push(format!("{} enabled", ctx.enabled.len()));
+    }
+    if !ctx.disabled.is_empty() {
+        parts.push(format!("{} disabled", ctx.disabled.len()));
+    }
+    if !ctx.skipped.is_empty() {
+        parts.push(format!("{} skipped", ctx.skipped.len()));
+    }
+    if !ctx.failed.is_empty() {
+        parts.push(format!("{} failed", ctx.failed.len()));
+    }
+    let status_msg = if parts.is_empty() {
+        "no changes".to_string()
     } else {
-        format!(
-            "{} enabled, {} skipped, {} failed",
-            ctx.enabled.len(),
-            ctx.skipped.len(),
-            ctx.failed.len()
-        )
+        parts.join(", ")
     };
     ctx.wiz(3, StepStatus::Done(status_msg));
     Ok(SetupStage::ConfigureOauth)
@@ -1627,6 +1749,7 @@ pub async fn run_setup(args: &[String]) -> Result<(), GwsError> {
         client_id: String::new(),
         client_secret: String::new(),
         enabled: Vec::new(),
+        disabled: Vec::new(),
         skipped: Vec::new(),
         failed: Vec::new(),
     };
@@ -2244,6 +2367,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_pipeline_previously_enabled_can_be_deselected() {
+        // Simulate: first two APIs are already enabled (pre-selected, but NOT fixed)
+        let items: Vec<SelectItem> = WORKSPACE_APIS
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let already = i < 2;
+                SelectItem {
+                    label: a.name.to_string(),
+                    description: if already {
+                        format!("{} (already enabled)", a.id)
+                    } else {
+                        a.id.to_string()
+                    },
+                    selected: already,
+                    is_fixed: false, // The fix: previously this was `already`
+                    is_template: false,
+                    template_selects: vec![],
+                }
+            })
+            .collect();
+        // Press space to deselect first item, then Enter to confirm
+        let result = simulate_picker(items, &[KeyCode::Char(' '), KeyCode::Enter], true);
+        match resolve_api_selection(&result) {
+            SetupAction::EnableApis(ids) => {
+                // First API should be deselected, second should remain
+                assert_eq!(ids.len(), 1);
+                assert_eq!(ids[0], WORKSPACE_APIS[1].id);
+            }
+            _ => panic!("Expected EnableApis"),
+        }
+    }
+
     // ── enable_apis unit tests ──────────────────────────────────
 
     #[tokio::test]
@@ -2266,6 +2423,25 @@ mod tests {
         assert!(enabled.is_empty());
         assert!(skipped.is_empty());
         // Should have exactly one failure with a non-empty error message
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, "storage.googleapis.com");
+        assert!(!failed[0].1.is_empty(), "Error message should not be empty");
+    }
+
+    // ── disable_apis unit tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_disable_apis_with_no_apis() {
+        let (disabled, failed) = disable_apis("__nonexistent__", &[]).await;
+        assert!(disabled.is_empty());
+        assert!(failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_disable_apis_with_invalid_project() {
+        let apis = vec!["storage.googleapis.com".to_string()];
+        let (disabled, failed) = disable_apis("__nonexistent_project_99999__", &apis).await;
+        assert!(disabled.is_empty());
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].0, "storage.googleapis.com");
         assert!(!failed[0].1.is_empty(), "Error message should not be empty");
