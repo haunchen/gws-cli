@@ -377,33 +377,52 @@ pub struct SetupOptions {
     pub login: bool,
 }
 
-/// Parse setup flags from args.
-pub fn parse_setup_args(args: &[String]) -> SetupOptions {
-    let mut project = None;
-    let mut dry_run = false;
-    let mut login = false;
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--project" && i + 1 < args.len() {
-            project = Some(args[i + 1].clone());
-            i += 2;
-        } else if args[i].starts_with("--project=") {
-            project = Some(args[i].split_once('=').unwrap().1.to_string());
-            i += 1;
-        } else if args[i] == "--dry-run" {
-            dry_run = true;
-            i += 1;
-        } else if args[i] == "--login" {
-            login = true;
-            i += 1;
-        } else {
-            i += 1;
+/// Build the clap Command for `gws auth setup`.
+fn setup_command() -> clap::Command {
+    clap::Command::new("setup")
+        .about("Configure GCP project + OAuth client (requires gcloud)")
+        .arg(
+            clap::Arg::new("project")
+                .long("project")
+                .help("Use a specific GCP project")
+                .value_name("id"),
+        )
+        .arg(
+            clap::Arg::new("login")
+                .long("login")
+                .help("Run `gws auth login` after successful setup")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("dry-run")
+                .long("dry-run")
+                .help("Preview changes without making them")
+                .action(clap::ArgAction::SetTrue),
+        )
+}
+
+/// Parse setup flags from args using clap.
+/// Returns `Ok(Some(opts))` on success, `Ok(None)` if clap handled
+/// `--help`/`--version` (already printed), or `Err` for invalid args.
+pub fn parse_setup_args(args: &[String]) -> Result<Option<SetupOptions>, GwsError> {
+    match setup_command()
+        .try_get_matches_from(std::iter::once("setup".to_string()).chain(args.iter().cloned()))
+    {
+        Ok(matches) => Ok(Some(SetupOptions {
+            project: matches.get_one::<String>("project").cloned(),
+            dry_run: matches.get_flag("dry-run"),
+            login: matches.get_flag("login"),
+        })),
+        Err(e)
+            if e.kind() == clap::error::ErrorKind::DisplayHelp
+                || e.kind() == clap::error::ErrorKind::DisplayVersion =>
+        {
+            e.print().map_err(|io_err| {
+                GwsError::Validation(format!("Failed to print help: {io_err}"))
+            })?;
+            Ok(None)
         }
-    }
-    SetupOptions {
-        project,
-        dry_run,
-        login,
+        Err(e) => Err(GwsError::Validation(e.to_string())),
     }
 }
 
@@ -1599,7 +1618,11 @@ fn prompt_login_after_setup() -> Result<bool, GwsError> {
 
 /// Run the full setup flow. Orchestrates all steps and outputs JSON summary.
 pub async fn run_setup(args: &[String]) -> Result<(), GwsError> {
-    let opts = parse_setup_args(args);
+    // parse_setup_args uses clap, which handles --help / -h automatically.
+    let opts = match parse_setup_args(args)? {
+        Some(opts) => opts,
+        None => return Ok(()), // --help was printed, exit cleanly
+    };
     let dry_run = opts.dry_run;
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin()) && !dry_run;
 
@@ -1826,7 +1849,7 @@ mod tests {
 
     #[test]
     fn test_parse_setup_args_empty() {
-        let opts = parse_setup_args(&[]);
+        let opts = parse_setup_args(&[]).unwrap().unwrap();
         assert!(opts.project.is_none());
         assert!(!opts.dry_run);
         assert!(!opts.login);
@@ -1835,7 +1858,7 @@ mod tests {
     #[test]
     fn test_parse_setup_args_with_project() {
         let args = vec!["--project".into(), "my-project".into()];
-        let opts = parse_setup_args(&args);
+        let opts = parse_setup_args(&args).unwrap().unwrap();
         assert_eq!(opts.project.as_deref(), Some("my-project"));
         assert!(!opts.login);
     }
@@ -1843,23 +1866,28 @@ mod tests {
     #[test]
     fn test_parse_setup_args_with_project_equals() {
         let args = vec!["--project=my-project".into()];
-        let opts = parse_setup_args(&args);
+        let opts = parse_setup_args(&args).unwrap().unwrap();
         assert_eq!(opts.project.as_deref(), Some("my-project"));
         assert!(!opts.login);
     }
 
     #[test]
-    fn test_parse_setup_args_ignores_unknown() {
-        let args = vec!["--verbose".into(), "--unknown".into()];
-        let opts = parse_setup_args(&args);
-        assert!(opts.project.is_none());
-        assert!(!opts.login);
+    fn test_parse_setup_args_rejects_unknown() {
+        let args = vec!["--verbose".into()];
+        assert!(parse_setup_args(&args).is_err());
+    }
+
+    #[test]
+    fn test_parse_setup_args_help_returns_none() {
+        let args = vec!["--help".into()];
+        // --help triggers display and returns Ok(None) for clean exit
+        assert!(parse_setup_args(&args).unwrap().is_none());
     }
 
     #[test]
     fn test_parse_setup_args_dry_run() {
         let args = vec!["--dry-run".into()];
-        let opts = parse_setup_args(&args);
+        let opts = parse_setup_args(&args).unwrap().unwrap();
         assert!(opts.dry_run);
         assert!(!opts.login);
     }
@@ -1867,7 +1895,7 @@ mod tests {
     #[test]
     fn test_parse_setup_args_dry_run_with_project() {
         let args: Vec<String> = vec!["--dry-run".into(), "--project".into(), "p".into()];
-        let opts = parse_setup_args(&args);
+        let opts = parse_setup_args(&args).unwrap().unwrap();
         assert!(opts.dry_run);
         assert_eq!(opts.project.as_deref(), Some("p"));
         assert!(!opts.login);
@@ -1876,7 +1904,7 @@ mod tests {
     #[test]
     fn test_parse_setup_args_login_flag() {
         let args: Vec<String> = vec!["--login".into()];
-        let opts = parse_setup_args(&args);
+        let opts = parse_setup_args(&args).unwrap().unwrap();
         assert!(opts.login);
         assert!(!opts.dry_run);
         assert!(opts.project.is_none());
