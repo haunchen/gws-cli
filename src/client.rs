@@ -1,5 +1,11 @@
 use reqwest::header::{HeaderMap, HeaderValue};
 
+const MAX_RETRIES: u32 = 3;
+/// Maximum seconds to sleep on a 429 Retry-After header. Prevents a hostile
+/// or misconfigured server from hanging the process indefinitely.
+const MAX_RETRY_DELAY_SECS: u64 = 60;
+const CONNECT_TIMEOUT_SECS: u64 = 10;
+
 pub fn build_client() -> Result<reqwest::Client, crate::error::GwsError> {
     let mut headers = HeaderMap::new();
     let name = env!("CARGO_PKG_NAME");
@@ -13,40 +19,50 @@ pub fn build_client() -> Result<reqwest::Client, crate::error::GwsError> {
 
     reqwest::Client::builder()
         .default_headers(headers)
+        .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .build()
         .map_err(|e| {
             crate::error::GwsError::Other(anyhow::anyhow!("Failed to build HTTP client: {e}"))
         })
 }
 
-const MAX_RETRIES: u32 = 3;
-/// Maximum seconds to sleep on a 429 Retry-After header. Prevents a hostile
-/// or misconfigured server from hanging the process indefinitely.
-const MAX_RETRY_DELAY_SECS: u64 = 60;
-
-/// Send an HTTP request with automatic retry on 429 (rate limit) responses.
+/// Send an HTTP request with automatic retry on 429 (rate limit) responses
+/// and transient connection/timeout errors.
 /// Respects the `Retry-After` header; falls back to exponential backoff (1s, 2s, 4s).
 pub async fn send_with_retry(
     build_request: impl Fn() -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, reqwest::Error> {
+    let mut last_err: Option<reqwest::Error> = None;
+
     for attempt in 0..MAX_RETRIES {
-        let resp = build_request().send().await?;
+        match build_request().send().await {
+            Ok(resp) => {
+                if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return Ok(resp);
+                }
 
-        if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Ok(resp);
+                let header_value = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok());
+                let retry_after = compute_retry_delay(header_value, attempt);
+                tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
+            }
+            Err(e) if e.is_connect() || e.is_timeout() => {
+                // Transient network error — retry with exponential backoff
+                let delay = compute_retry_delay(None, attempt);
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
         }
-
-        let header_value = resp
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok());
-        let retry_after = compute_retry_delay(header_value, attempt);
-
-        tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
     }
 
     // Final attempt — return whatever we get
-    build_request().send().await
+    match build_request().send().await {
+        Ok(resp) => Ok(resp),
+        Err(e) => Err(last_err.unwrap_or(e)),
+    }
 }
 
 /// Compute the retry delay from a Retry-After header value and attempt number.
